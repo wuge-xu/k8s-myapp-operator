@@ -1,0 +1,9 @@
+apiVersion: app.demo.io/v1
+kind: MyApp
+metadata:
+  labels:
+    app.kubernetes.io/name: k8s-myapp-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: myapp-sample
+spec:
+  # TODO(user): Add fields here
