@@ -1,135 +1,69 @@
-# k8s-myapp-operator
-// TODO(user): Add simple overview of use/purpose
+# K8s MyApp Operator
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+一个用 Go + Kubebuilder 编写的 Kubernetes Operator，定义了一个自定义资源 `MyApp`，并实现控制循环（Reconcile Loop），自动根据 `MyApp` 的定义创建、更新对应的 Deployment。
 
-## Getting Started
+## 功能
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- 定义自定义资源 `MyApp`（CRD），用户只需声明期望的副本数
+- 控制器持续监听 `MyApp` 的创建/更新事件
+- 自动创建对应的 Deployment，并使其副本数与 `MyApp.spec.replicas` 保持一致
+- 通过 owner reference 建立 MyApp 与 Deployment 的所属关系：删除 MyApp 会自动级联删除对应 Deployment
+- 修改 `MyApp.spec.replicas` 后，控制器会自动调谐 Deployment 副本数，使其趋同于期望状态
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## 技术栈
 
-```sh
-make docker-build docker-push IMG=<some-registry>/k8s-myapp-operator:tag
-```
+- Go
+- [Kubebuilder](https://book.kubebuilder.io/)：用于生成 Operator 项目骨架、CRD 定义
+- [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)：实现调谐循环的核心库
+- client-go
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+## 使用方式
 
-**Install the CRDs into the cluster:**
+### 1. 安装 CRD 到集群
 
-```sh
+\`\`\`bash
 make install
-```
+\`\`\`
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### 2. 运行控制器（本地调试模式）
 
-```sh
-make deploy IMG=<some-registry>/k8s-myapp-operator:tag
-```
+\`\`\`bash
+make run
+\`\`\`
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+### 3. 创建一个 MyApp 资源
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+\`\`\`yaml
+apiVersion: app.demo.io/v1
+kind: MyApp
+metadata:
+  name: my-app-example
+spec:
+  replicas: 3
+\`\`\`
 
-```sh
-kubectl apply -k config/samples/
-```
+\`\`\`bash
+kubectl apply -f myapp-sample.yaml
+\`\`\`
 
->**NOTE**: Ensure that the samples has default values to test it out.
+控制器会自动创建一个同名的 Deployment，副本数为3。
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+### 4. 验证
 
-```sh
-kubectl delete -k config/samples/
-```
+\`\`\`bash
+kubectl get deployments
+kubectl get pods -l app=my-app-example
+\`\`\`
 
-**Delete the APIs(CRDs) from the cluster:**
+### 5. 修改副本数，验证自动调谐
 
-```sh
-make uninstall
-```
+\`\`\`bash
+kubectl patch myapp my-app-example --type=merge -p '{"spec":{"replicas":5}}'
+kubectl get deployments
+\`\`\`
 
-**UnDeploy the controller from the cluster:**
+Deployment 的副本数会自动同步为5，无需手动操作。
 
-```sh
-make undeploy
-```
+## 开发与测试环境
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/k8s-myapp-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/k8s-myapp-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+本项目在 WSL2 + K3s 单节点集群上开发和验证。
