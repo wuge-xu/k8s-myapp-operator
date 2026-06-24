@@ -18,9 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // MyAppSpec defines the desired state of MyApp
 type MyAppSpec struct {
 	// replicas is the desired number of pod replicas for this MyApp
@@ -31,15 +28,15 @@ type MyAppSpec struct {
 
 // MyAppStatus defines the observed state of MyApp.
 type MyAppStatus struct {
+	// phase represents the current lifecycle phase of the MyApp
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
+	// readyReplicas is the number of pods that are ready
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
 	// conditions represent the current state of the MyApp resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -48,6 +45,10 @@ type MyAppStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"
+// +kubebuilder:printcolumn:name="Desired",type="integer",JSONPath=".spec.replicas"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // MyApp is the Schema for the myapps API
 type MyApp struct {

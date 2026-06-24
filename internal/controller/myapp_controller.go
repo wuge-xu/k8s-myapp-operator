@@ -30,7 +30,6 @@ import (
 	appv1 "k8s-myapp-operator/api/v1"
 )
 
-// MyAppReconciler reconciles a MyApp object
 type MyAppReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -44,6 +43,7 @@ type MyAppReconciler struct {
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// 第一步：获取 MyApp 对象
 	var myApp appv1.MyApp
 	if err := r.Get(ctx, req.NamespacedName, &myApp); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -52,8 +52,10 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	// 第二步：构造期望的 Deployment
 	desiredDeployment := buildDeployment(&myApp, r.Scheme)
 
+	// 第三步：查找是否已有对应 Deployment
 	var existingDeployment appsv1.Deployment
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      myApp.Name,
@@ -66,11 +68,13 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			if err := r.Create(ctx, desiredDeployment); err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, nil
+			// 刚创建完，Deployment 还没有真实状态，先同步一个 Pending 状态
+			return r.updateStatus(ctx, &myApp, "Pending", 0)
 		}
 		return ctrl.Result{}, err
 	}
 
+	// 第四步：如果副本数不一致，更新 Deployment
 	if *existingDeployment.Spec.Replicas != myApp.Spec.Replicas {
 		log.Info("updating deployment replicas",
 			"name", existingDeployment.Name,
@@ -83,6 +87,31 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
+	// 第五步：根据 Deployment 的真实状态，同步到 MyApp.Status
+	// existingDeployment.Status.ReadyReplicas 是 K8s 自动维护的字段，
+	// 表示"当前有多少个 Pod 已经通过了健康检查、处于 Ready 状态"
+	readyReplicas := existingDeployment.Status.ReadyReplicas
+	phase := "Pending"
+	if readyReplicas == myApp.Spec.Replicas {
+		phase = "Running"
+	} else if readyReplicas > 0 {
+		phase = "Degraded"
+	}
+
+	return r.updateStatus(ctx, &myApp, phase, readyReplicas)
+}
+
+// updateStatus 把 phase 和 readyReplicas 写回 MyApp 的 status 字段
+// 注意：这里用的是 r.Status().Update()，而不是 r.Update()
+// 原因：MyApp 开启了 status subresource，status 字段必须通过专门的 status 接口更新
+// 如果用普通的 r.Update()，K8s 会忽略 status 字段的变化，根本不会生效
+func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, phase string, readyReplicas int32) (ctrl.Result, error) {
+	myApp.Status.Phase = phase
+	myApp.Status.ReadyReplicas = readyReplicas
+
+	if err := r.Status().Update(ctx, myApp); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -120,11 +149,9 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 	}
 
 	controllerutil.SetControllerReference(myApp, deployment, scheme)
-
 	return deployment
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *MyAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appv1.MyApp{}).
