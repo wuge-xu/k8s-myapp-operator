@@ -33,8 +33,6 @@ import (
 	appv1 "k8s-myapp-operator/api/v1"
 )
 
-// myAppFinalizer 是我们给这个 Operator 起的 Finalizer 名字
-// 命名惯例是 "操作.域名/版本"，全局唯一即可
 const myAppFinalizer = "cleanup.app.demo.io"
 
 type MyAppReconciler struct {
@@ -60,21 +58,13 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// 关键判断：检查 DeletionTimestamp 是否被设置
-	// 用户执行 kubectl delete 之后，K8s 不会立刻删除对象，
-	// 而是在对象上打上 DeletionTimestamp 这个时间戳，表示"待删除"
-	// 控制器检测到这个时间戳，就知道该执行清理逻辑了
 	if !myApp.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, &myApp, log)
 	}
 
-	// 正常调谐流程：确保 Finalizer 已经注册到这个对象上
-	// controllerutil.ContainsFinalizer 检查对象上是否已经有这个 Finalizer
 	if !controllerutil.ContainsFinalizer(&myApp, myAppFinalizer) {
 		log.Info("adding finalizer", "finalizer", myAppFinalizer)
 		controllerutil.AddFinalizer(&myApp, myAppFinalizer)
-		// 注意：修改 Finalizer 列表之后必须立刻 Update，
-		// 否则这个变化只存在于内存里，不会写入 K8s
 		if err := r.Update(ctx, &myApp); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -111,22 +101,16 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	return r.updateStatus(ctx, &myApp, phase, readyReplicas)
 }
 
-// handleDeletion 在对象被标记为待删除时执行
 func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(myApp, myAppFinalizer) {
-		// Finalizer 已经被移除了，不需要再做任何事
 		return ctrl.Result{}, nil
 	}
 
-	// 在这里执行你的自定义清理逻辑
-	// 真实项目里可以是：通知外部系统、清理数据库记录、等待任务完成等
-	// 这里我们用打印日志来模拟
 	log.Info("executing cleanup before deletion",
 		"name", myApp.Name,
 		"namespace", myApp.Namespace,
 	)
 
-	// 清理完成，移除 Finalizer，K8s 才会真正删除这个对象
 	controllerutil.RemoveFinalizer(myApp, myAppFinalizer)
 	if err := r.Update(ctx, myApp); err != nil {
 		return ctrl.Result{}, err
@@ -183,9 +167,36 @@ func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.
 		return err
 	}
 
+	// 获取当前容器的镜像（取第一个容器）
+	currentImage := ""
+	if len(existing.Spec.Template.Spec.Containers) > 0 {
+		currentImage = existing.Spec.Template.Spec.Containers[0].Image
+	}
+
+	// 期望的镜像，如果用户没填就用默认值
+	desiredImage := myApp.Spec.Image
+	if desiredImage == "" {
+		desiredImage = "nginx:latest"
+	}
+
+	needsUpdate := false
 	if *existing.Spec.Replicas != myApp.Spec.Replicas {
 		log.Info("updating deployment replicas", "name", existing.Name)
 		existing.Spec.Replicas = &myApp.Spec.Replicas
+		needsUpdate = true
+	}
+
+	if currentImage != desiredImage {
+		log.Info("updating deployment image",
+			"name", existing.Name,
+			"from", currentImage,
+			"to", desiredImage,
+		)
+		existing.Spec.Template.Spec.Containers[0].Image = desiredImage
+		needsUpdate = true
+	}
+
+	if needsUpdate {
 		return r.Update(ctx, &existing)
 	}
 
@@ -245,6 +256,11 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 	replicas := myApp.Spec.Replicas
 	labels := map[string]string{"app": myApp.Name}
 
+	image := myApp.Spec.Image
+	if image == "" {
+		image = "nginx:latest"
+	}
+
 	var envFrom []corev1.EnvFromSource
 	if len(myApp.Spec.Config) > 0 {
 		envFrom = []corev1.EnvFromSource{
@@ -271,11 +287,9 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "app",
-							Image: "nginx:latest",
-							Ports: []corev1.ContainerPort{
-								{ContainerPort: myApp.Spec.Port},
-							},
+							Name:    "app",
+							Image:   image,
+							Ports:   []corev1.ContainerPort{{ContainerPort: myApp.Spec.Port}},
 							EnvFrom: envFrom,
 						},
 					},

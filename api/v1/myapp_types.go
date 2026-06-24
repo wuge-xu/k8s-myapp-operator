@@ -31,6 +31,11 @@ type MyAppSpec struct {
 	// +required
 	Port int32 `json:"port"`
 
+	// image is the container image to use for this MyApp
+	// +kubebuilder:default="nginx:latest"
+	// +optional
+	Image string `json:"image,omitempty"`
+
 	// config is a map of environment variables to inject into the application
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
@@ -59,6 +64,7 @@ type MyAppStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"
 // +kubebuilder:printcolumn:name="Desired",type="integer",JSONPath=".spec.replicas"
 // +kubebuilder:printcolumn:name="Port",type="integer",JSONPath=".spec.port"
+// +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".spec.image"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // MyApp is the Schema for the myapps API

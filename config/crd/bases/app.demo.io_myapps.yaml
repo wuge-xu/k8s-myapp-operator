@@ -27,6 +27,9 @@ spec:
     - jsonPath: .spec.port
       name: Port
       type: integer
+    - jsonPath: .spec.image
+      name: Image
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -61,6 +64,10 @@ spec:
                 description: config is a map of environment variables to inject into
                   the application
                 type: object
+              image:
+                default: nginx:latest
+                description: image is the container image to use for this MyApp
+                type: string
               port:
                 description: port is the port that the application listens on
                 format: int32
