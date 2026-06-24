@@ -55,6 +55,12 @@ spec:
           spec:
             description: spec defines the desired state of MyApp
             properties:
+              config:
+                additionalProperties:
+                  type: string
+                description: config is a map of environment variables to inject into
+                  the application
+                type: object
               port:
                 description: port is the port that the application listens on
                 format: int32

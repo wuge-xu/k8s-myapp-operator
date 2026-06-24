@@ -15,6 +15,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -42,6 +43,7 @@ type MyAppReconciler struct {
 // +kubebuilder:rbac:groups=app.demo.io,resources=myapps/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -54,14 +56,22 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	// 第一步：处理 ConfigMap（要在 Deployment 之前，因为 Deployment 要引用它）
+	if err := r.reconcileConfigMap(ctx, &myApp, log); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 第二步：处理 Deployment
 	if err := r.reconcileDeployment(ctx, &myApp, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	// 第三步：处理 Service
 	if err := r.reconcileService(ctx, &myApp, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	// 第四步：同步 Status
 	var existingDeployment appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      myApp.Name,
@@ -79,6 +89,40 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	return r.updateStatus(ctx, &myApp, phase, readyReplicas)
+}
+
+func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
+	// 如果用户没有填 config 字段，跳过，不创建 ConfigMap
+	if len(myApp.Spec.Config) == 0 {
+		return nil
+	}
+
+	desired := buildConfigMap(myApp, r.Scheme)
+
+	var existing corev1.ConfigMap
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      myApp.Name + "-config",
+		Namespace: myApp.Namespace,
+	}, &existing)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("creating configmap", "name", desired.Name)
+			return r.Create(ctx, desired)
+		}
+		return err
+	}
+
+	// 检查数据是否和期望一致，不一致则更新
+	// reflect.DeepEqual 是 Go 标准库提供的"深度比较"函数
+	// 普通的 == 只能比较基础类型，对 map 这种复合类型必须用 DeepEqual
+	if !reflect.DeepEqual(existing.Data, myApp.Spec.Config) {
+		log.Info("updating configmap", "name", existing.Name)
+		existing.Data = myApp.Spec.Config
+		return r.Update(ctx, &existing)
+	}
+
+	return nil
 }
 
 func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
@@ -144,9 +188,35 @@ func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, 
 	return ctrl.Result{}, nil
 }
 
+func buildConfigMap(myApp *appv1.MyApp, scheme *runtime.Scheme) *corev1.ConfigMap {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      myApp.Name + "-config",
+			Namespace: myApp.Namespace,
+		},
+		Data: myApp.Spec.Config,
+	}
+	controllerutil.SetControllerReference(myApp, cm, scheme)
+	return cm
+}
+
 func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deployment {
 	replicas := myApp.Spec.Replicas
 	labels := map[string]string{"app": myApp.Name}
+
+	// 如果有 config，给容器加上 envFrom，从 ConfigMap 里注入所有环境变量
+	var envFrom []corev1.EnvFromSource
+	if len(myApp.Spec.Config) > 0 {
+		envFrom = []corev1.EnvFromSource{
+			{
+				ConfigMapRef: &corev1.ConfigMapEnvSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: myApp.Name + "-config",
+					},
+				},
+			},
+		}
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -166,6 +236,7 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 							Ports: []corev1.ContainerPort{
 								{ContainerPort: myApp.Spec.Port},
 							},
+							EnvFrom: envFrom,
 						},
 					},
 				},
@@ -207,6 +278,7 @@ func (r *MyAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&appv1.MyApp{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
 		Named("myapp").
 		Complete(r)
 }

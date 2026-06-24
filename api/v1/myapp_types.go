@@ -30,6 +30,10 @@ type MyAppSpec struct {
 	// +kubebuilder:validation:Maximum=65535
 	// +required
 	Port int32 `json:"port"`
+
+	// config is a map of environment variables to inject into the application
+	// +optional
+	Config map[string]string `json:"config,omitempty"`
 }
 
 // MyAppStatus defines the observed state of MyApp.
