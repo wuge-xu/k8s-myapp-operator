@@ -33,6 +33,10 @@ import (
 	appv1 "k8s-myapp-operator/api/v1"
 )
 
+// myAppFinalizer 是我们给这个 Operator 起的 Finalizer 名字
+// 命名惯例是 "操作.域名/版本"，全局唯一即可
+const myAppFinalizer = "cleanup.app.demo.io"
+
 type MyAppReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -56,22 +60,38 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// 第一步：处理 ConfigMap（要在 Deployment 之前，因为 Deployment 要引用它）
+	// 关键判断：检查 DeletionTimestamp 是否被设置
+	// 用户执行 kubectl delete 之后，K8s 不会立刻删除对象，
+	// 而是在对象上打上 DeletionTimestamp 这个时间戳，表示"待删除"
+	// 控制器检测到这个时间戳，就知道该执行清理逻辑了
+	if !myApp.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, &myApp, log)
+	}
+
+	// 正常调谐流程：确保 Finalizer 已经注册到这个对象上
+	// controllerutil.ContainsFinalizer 检查对象上是否已经有这个 Finalizer
+	if !controllerutil.ContainsFinalizer(&myApp, myAppFinalizer) {
+		log.Info("adding finalizer", "finalizer", myAppFinalizer)
+		controllerutil.AddFinalizer(&myApp, myAppFinalizer)
+		// 注意：修改 Finalizer 列表之后必须立刻 Update，
+		// 否则这个变化只存在于内存里，不会写入 K8s
+		if err := r.Update(ctx, &myApp); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	if err := r.reconcileConfigMap(ctx, &myApp, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 第二步：处理 Deployment
 	if err := r.reconcileDeployment(ctx, &myApp, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 第三步：处理 Service
 	if err := r.reconcileService(ctx, &myApp, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 第四步：同步 Status
 	var existingDeployment appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      myApp.Name,
@@ -91,8 +111,32 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	return r.updateStatus(ctx, &myApp, phase, readyReplicas)
 }
 
+// handleDeletion 在对象被标记为待删除时执行
+func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(myApp, myAppFinalizer) {
+		// Finalizer 已经被移除了，不需要再做任何事
+		return ctrl.Result{}, nil
+	}
+
+	// 在这里执行你的自定义清理逻辑
+	// 真实项目里可以是：通知外部系统、清理数据库记录、等待任务完成等
+	// 这里我们用打印日志来模拟
+	log.Info("executing cleanup before deletion",
+		"name", myApp.Name,
+		"namespace", myApp.Namespace,
+	)
+
+	// 清理完成，移除 Finalizer，K8s 才会真正删除这个对象
+	controllerutil.RemoveFinalizer(myApp, myAppFinalizer)
+	if err := r.Update(ctx, myApp); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	log.Info("finalizer removed, object will be deleted", "name", myApp.Name)
+	return ctrl.Result{}, nil
+}
+
 func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
-	// 如果用户没有填 config 字段，跳过，不创建 ConfigMap
 	if len(myApp.Spec.Config) == 0 {
 		return nil
 	}
@@ -113,9 +157,6 @@ func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.M
 		return err
 	}
 
-	// 检查数据是否和期望一致，不一致则更新
-	// reflect.DeepEqual 是 Go 标准库提供的"深度比较"函数
-	// 普通的 == 只能比较基础类型，对 map 这种复合类型必须用 DeepEqual
 	if !reflect.DeepEqual(existing.Data, myApp.Spec.Config) {
 		log.Info("updating configmap", "name", existing.Name)
 		existing.Data = myApp.Spec.Config
@@ -204,7 +245,6 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 	replicas := myApp.Spec.Replicas
 	labels := map[string]string{"app": myApp.Name}
 
-	// 如果有 config，给容器加上 envFrom，从 ConfigMap 里注入所有环境变量
 	var envFrom []corev1.EnvFromSource
 	if len(myApp.Spec.Config) > 0 {
 		envFrom = []corev1.EnvFromSource{
