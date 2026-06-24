@@ -24,6 +24,12 @@ type MyAppSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +required
 	Replicas int32 `json:"replicas"`
+
+	// port is the port that the application listens on
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +required
+	Port int32 `json:"port"`
 }
 
 // MyAppStatus defines the observed state of MyApp.
@@ -48,6 +54,7 @@ type MyAppStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"
 // +kubebuilder:printcolumn:name="Desired",type="integer",JSONPath=".spec.replicas"
+// +kubebuilder:printcolumn:name="Port",type="integer",JSONPath=".spec.port"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // MyApp is the Schema for the myapps API

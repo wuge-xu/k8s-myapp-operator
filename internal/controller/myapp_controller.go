@@ -16,12 +16,14 @@ package controller
 import (
 	"context"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,11 +41,11 @@ type MyAppReconciler struct {
 // +kubebuilder:rbac:groups=app.demo.io,resources=myapps/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=app.demo.io,resources=myapps/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// 第一步：获取 MyApp 对象
 	var myApp appv1.MyApp
 	if err := r.Get(ctx, req.NamespacedName, &myApp); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -52,44 +54,22 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// 第二步：构造期望的 Deployment
-	desiredDeployment := buildDeployment(&myApp, r.Scheme)
-
-	// 第三步：查找是否已有对应 Deployment
-	var existingDeployment appsv1.Deployment
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      myApp.Name,
-		Namespace: myApp.Namespace,
-	}, &existingDeployment)
-
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("creating new deployment", "name", desiredDeployment.Name)
-			if err := r.Create(ctx, desiredDeployment); err != nil {
-				return ctrl.Result{}, err
-			}
-			// 刚创建完，Deployment 还没有真实状态，先同步一个 Pending 状态
-			return r.updateStatus(ctx, &myApp, "Pending", 0)
-		}
+	if err := r.reconcileDeployment(ctx, &myApp, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 第四步：如果副本数不一致，更新 Deployment
-	if *existingDeployment.Spec.Replicas != myApp.Spec.Replicas {
-		log.Info("updating deployment replicas",
-			"name", existingDeployment.Name,
-			"from", *existingDeployment.Spec.Replicas,
-			"to", myApp.Spec.Replicas,
-		)
-		existingDeployment.Spec.Replicas = &myApp.Spec.Replicas
-		if err := r.Update(ctx, &existingDeployment); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := r.reconcileService(ctx, &myApp, log); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// 第五步：根据 Deployment 的真实状态，同步到 MyApp.Status
-	// existingDeployment.Status.ReadyReplicas 是 K8s 自动维护的字段，
-	// 表示"当前有多少个 Pod 已经通过了健康检查、处于 Ready 状态"
+	var existingDeployment appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      myApp.Name,
+		Namespace: myApp.Namespace,
+	}, &existingDeployment); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	readyReplicas := existingDeployment.Status.ReadyReplicas
 	phase := "Pending"
 	if readyReplicas == myApp.Spec.Replicas {
@@ -101,14 +81,63 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	return r.updateStatus(ctx, &myApp, phase, readyReplicas)
 }
 
-// updateStatus 把 phase 和 readyReplicas 写回 MyApp 的 status 字段
-// 注意：这里用的是 r.Status().Update()，而不是 r.Update()
-// 原因：MyApp 开启了 status subresource，status 字段必须通过专门的 status 接口更新
-// 如果用普通的 r.Update()，K8s 会忽略 status 字段的变化，根本不会生效
+func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
+	desired := buildDeployment(myApp, r.Scheme)
+
+	var existing appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      myApp.Name,
+		Namespace: myApp.Namespace,
+	}, &existing)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("creating deployment", "name", desired.Name)
+			return r.Create(ctx, desired)
+		}
+		return err
+	}
+
+	if *existing.Spec.Replicas != myApp.Spec.Replicas {
+		log.Info("updating deployment replicas", "name", existing.Name)
+		existing.Spec.Replicas = &myApp.Spec.Replicas
+		return r.Update(ctx, &existing)
+	}
+
+	return nil
+}
+
+func (r *MyAppReconciler) reconcileService(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
+	desired := buildService(myApp, r.Scheme)
+
+	var existing corev1.Service
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      myApp.Name + "-service",
+		Namespace: myApp.Namespace,
+	}, &existing)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("creating service", "name", desired.Name)
+			return r.Create(ctx, desired)
+		}
+		return err
+	}
+
+	if len(existing.Spec.Ports) > 0 &&
+		existing.Spec.Ports[0].Port != myApp.Spec.Port {
+		log.Info("updating service port", "name", existing.Name)
+		existing.Spec.Ports[0].Port = myApp.Spec.Port
+		existing.Spec.Ports[0].TargetPort = intstr.FromInt32(myApp.Spec.Port)
+		return r.Update(ctx, &existing)
+	}
+
+	return nil
+}
+
 func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, phase string, readyReplicas int32) (ctrl.Result, error) {
 	myApp.Status.Phase = phase
 	myApp.Status.ReadyReplicas = readyReplicas
-
 	if err := r.Status().Update(ctx, myApp); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -117,10 +146,7 @@ func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, 
 
 func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deployment {
 	replicas := myApp.Spec.Replicas
-
-	labels := map[string]string{
-		"app": myApp.Name,
-	}
+	labels := map[string]string{"app": myApp.Name}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -129,18 +155,17 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
 							Name:  "app",
 							Image: "nginx:latest",
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: myApp.Spec.Port},
+							},
 						},
 					},
 				},
@@ -152,10 +177,36 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 	return deployment
 }
 
+func buildService(myApp *appv1.MyApp, scheme *runtime.Scheme) *corev1.Service {
+	labels := map[string]string{"app": myApp.Name}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      myApp.Name + "-service",
+			Namespace: myApp.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{
+				{
+					Port:       myApp.Spec.Port,
+					TargetPort: intstr.FromInt32(myApp.Spec.Port),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Type: corev1.ServiceTypeClusterIP,
+		},
+	}
+
+	controllerutil.SetControllerReference(myApp, svc, scheme)
+	return svc
+}
+
 func (r *MyAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appv1.MyApp{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Named("myapp").
 		Complete(r)
 }

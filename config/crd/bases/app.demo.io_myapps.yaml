@@ -24,6 +24,9 @@ spec:
     - jsonPath: .spec.replicas
       name: Desired
       type: integer
+    - jsonPath: .spec.port
+      name: Port
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -52,6 +55,12 @@ spec:
           spec:
             description: spec defines the desired state of MyApp
             properties:
+              port:
+                description: port is the port that the application listens on
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
               replicas:
                 description: replicas is the desired number of pod replicas for this
                   MyApp
@@ -59,6 +68,7 @@ spec:
                 minimum: 1
                 type: integer
             required:
+            - port
             - replicas
             type: object
           status:
