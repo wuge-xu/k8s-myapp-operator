@@ -16,8 +16,10 @@ package controller
 import (
 	"context"
 	"reflect"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -31,11 +33,48 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	appv1 "k8s-myapp-operator/api/v1"
 )
 
 const myAppFinalizer = "cleanup.app.demo.io"
+
+// 定义三个 Prometheus 指标
+// Counter：只增不减的计数器，适合记录"发生了多少次"
+// Histogram：分布直方图，适合记录"耗时分布"
+var (
+	reconcileTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "myapp_reconcile_total",
+			Help: "Total number of reconciliations",
+		},
+		[]string{"name", "namespace"},
+	)
+
+	reconcileErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "myapp_reconcile_errors_total",
+			Help: "Total number of reconciliation errors",
+		},
+		[]string{"name", "namespace"},
+	)
+
+	reconcileDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "myapp_reconcile_duration_seconds",
+			Help:    "Duration of reconciliation in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"name", "namespace"},
+	)
+)
+
+func init() {
+	// 把这三个指标注册到 controller-runtime 的默认注册表
+	// controller-runtime 的 /metrics 端点会自动暴露这个注册表里的所有指标
+	metrics.Registry.MustRegister(reconcileTotal, reconcileErrors, reconcileDuration)
+}
 
 type MyAppReconciler struct {
 	client.Client
@@ -52,6 +91,7 @@ type MyAppReconciler struct {
 
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	start := time.Now()
 
 	var myApp appv1.MyApp
 	if err := r.Get(ctx, req.NamespacedName, &myApp); err != nil {
@@ -61,40 +101,56 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	// 记录调谐次数
+	reconcileTotal.WithLabelValues(myApp.Name, myApp.Namespace).Inc()
+
+	var reconcileErr error
+	defer func() {
+		// 记录调谐耗时（无论成功还是失败都记录）
+		reconcileDuration.WithLabelValues(myApp.Name, myApp.Namespace).
+			Observe(time.Since(start).Seconds())
+		// 如果有错误，记录错误次数
+		if reconcileErr != nil {
+			reconcileErrors.WithLabelValues(myApp.Name, myApp.Namespace).Inc()
+		}
+	}()
+
 	if !myApp.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, &myApp, log)
+		var result ctrl.Result
+		result, reconcileErr = r.handleDeletion(ctx, &myApp, log)
+		return result, reconcileErr
 	}
 
 	if !controllerutil.ContainsFinalizer(&myApp, myAppFinalizer) {
 		log.Info("adding finalizer", "finalizer", myAppFinalizer)
 		controllerutil.AddFinalizer(&myApp, myAppFinalizer)
-		if err := r.Update(ctx, &myApp); err != nil {
-			return ctrl.Result{}, err
+		if reconcileErr = r.Update(ctx, &myApp); reconcileErr != nil {
+			return ctrl.Result{}, reconcileErr
 		}
 	}
 
-	if err := r.reconcileConfigMap(ctx, &myApp, log); err != nil {
-		return ctrl.Result{}, err
+	if reconcileErr = r.reconcileConfigMap(ctx, &myApp, log); reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
 	}
 
-	if err := r.reconcileDeployment(ctx, &myApp, log); err != nil {
-		return ctrl.Result{}, err
+	if reconcileErr = r.reconcileDeployment(ctx, &myApp, log); reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
 	}
 
-	if err := r.reconcileService(ctx, &myApp, log); err != nil {
-		return ctrl.Result{}, err
+	if reconcileErr = r.reconcileService(ctx, &myApp, log); reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
 	}
 
-	if err := r.reconcileHPA(ctx, &myApp, log); err != nil {
-		return ctrl.Result{}, err
+	if reconcileErr = r.reconcileHPA(ctx, &myApp, log); reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
 	}
 
 	var existingDeployment appsv1.Deployment
-	if err := r.Get(ctx, types.NamespacedName{
+	if reconcileErr = r.Get(ctx, types.NamespacedName{
 		Name:      myApp.Name,
 		Namespace: myApp.Namespace,
-	}, &existingDeployment); err != nil {
-		return ctrl.Result{}, err
+	}, &existingDeployment); reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
 	}
 
 	readyReplicas := existingDeployment.Status.ReadyReplicas
@@ -105,7 +161,9 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		phase = "Degraded"
 	}
 
-	return r.updateStatus(ctx, &myApp, phase, readyReplicas)
+	var result ctrl.Result
+	result, reconcileErr = r.updateStatus(ctx, &myApp, phase, readyReplicas)
+	return result, reconcileErr
 }
 
 func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) (ctrl.Result, error) {
@@ -122,7 +180,6 @@ func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp
 }
 
 func (r *MyAppReconciler) reconcileHPA(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
-	// 如果没有配置 autoscaling 或者 enabled=false，跳过
 	if myApp.Spec.Autoscaling == nil || !myApp.Spec.Autoscaling.Enabled {
 		return nil
 	}
@@ -143,7 +200,6 @@ func (r *MyAppReconciler) reconcileHPA(ctx context.Context, myApp *appv1.MyApp, 
 		return err
 	}
 
-	// 检查 min/max 副本数是否需要更新
 	needsUpdate := false
 	if myApp.Spec.Autoscaling.MinReplicas != nil &&
 		(existing.Spec.MinReplicas == nil ||
@@ -156,7 +212,6 @@ func (r *MyAppReconciler) reconcileHPA(ctx context.Context, myApp *appv1.MyApp, 
 		existing.Spec.MaxReplicas = *myApp.Spec.Autoscaling.MaxReplicas
 		needsUpdate = true
 	}
-
 	if needsUpdate {
 		log.Info("updating hpa", "name", existing.Name)
 		return r.Update(ctx, &existing)
@@ -277,8 +332,6 @@ func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, 
 
 func buildHPA(myApp *appv1.MyApp, scheme *runtime.Scheme) *autoscalingv2.HorizontalPodAutoscaler {
 	as := myApp.Spec.Autoscaling
-
-	// 默认 CPU 目标 80%
 	cpuTarget := int32(80)
 	if as.TargetCPUUtilizationPercentage != nil {
 		cpuTarget = *as.TargetCPUUtilizationPercentage
@@ -367,7 +420,6 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 							Image:   image,
 							Ports:   []corev1.ContainerPort{{ContainerPort: myApp.Spec.Port}},
 							EnvFrom: envFrom,
-							// HPA 需要容器声明资源 requests，否则无法计算 CPU 利用率
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
 									corev1.ResourceCPU:    resource.MustParse("100m"),
