@@ -18,9 +18,32 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// AutoscalingSpec defines the autoscaling configuration for MyApp
+type AutoscalingSpec struct {
+	// enabled controls whether autoscaling is enabled
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// minReplicas is the minimum number of replicas
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+
+	// maxReplicas is the maximum number of replicas
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+
+	// targetCPUUtilizationPercentage is the target CPU utilization percentage
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	TargetCPUUtilizationPercentage *int32 `json:"targetCPUUtilizationPercentage,omitempty"`
+}
+
 // MyAppSpec defines the desired state of MyApp
 type MyAppSpec struct {
-	// replicas is the desired number of pod replicas for this MyApp
+	// replicas is the desired number of pod replicas
 	// +kubebuilder:validation:Minimum=1
 	// +required
 	Replicas int32 `json:"replicas"`
@@ -31,14 +54,18 @@ type MyAppSpec struct {
 	// +required
 	Port int32 `json:"port"`
 
-	// image is the container image to use for this MyApp
+	// image is the container image to use
 	// +kubebuilder:default="nginx:latest"
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// config is a map of environment variables to inject into the application
+	// config is a map of environment variables to inject
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
+
+	// autoscaling defines the autoscaling configuration
+	// +optional
+	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 }
 
 // MyAppStatus defines the observed state of MyApp.
@@ -70,16 +97,10 @@ type MyAppStatus struct {
 // MyApp is the Schema for the myapps API
 type MyApp struct {
 	metav1.TypeMeta `json:",inline"`
-
-	// metadata is a standard object metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitzero"`
-
-	// spec defines the desired state of MyApp
 	// +required
 	Spec MyAppSpec `json:"spec"`
-
-	// status defines the observed state of MyApp
 	// +optional
 	Status MyAppStatus `json:"status,omitzero"`
 }

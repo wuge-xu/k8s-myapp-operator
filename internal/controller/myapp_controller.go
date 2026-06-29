@@ -19,8 +19,10 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -46,6 +48,7 @@ type MyAppReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -82,6 +85,10 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	if err := r.reconcileHPA(ctx, &myApp, log); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	var existingDeployment appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      myApp.Name,
@@ -105,19 +112,57 @@ func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp
 	if !controllerutil.ContainsFinalizer(myApp, myAppFinalizer) {
 		return ctrl.Result{}, nil
 	}
-
-	log.Info("executing cleanup before deletion",
-		"name", myApp.Name,
-		"namespace", myApp.Namespace,
-	)
-
+	log.Info("executing cleanup before deletion", "name", myApp.Name)
 	controllerutil.RemoveFinalizer(myApp, myAppFinalizer)
 	if err := r.Update(ctx, myApp); err != nil {
 		return ctrl.Result{}, err
 	}
-
 	log.Info("finalizer removed, object will be deleted", "name", myApp.Name)
 	return ctrl.Result{}, nil
+}
+
+func (r *MyAppReconciler) reconcileHPA(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
+	// 如果没有配置 autoscaling 或者 enabled=false，跳过
+	if myApp.Spec.Autoscaling == nil || !myApp.Spec.Autoscaling.Enabled {
+		return nil
+	}
+
+	desired := buildHPA(myApp, r.Scheme)
+
+	var existing autoscalingv2.HorizontalPodAutoscaler
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      myApp.Name + "-hpa",
+		Namespace: myApp.Namespace,
+	}, &existing)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("creating hpa", "name", desired.Name)
+			return r.Create(ctx, desired)
+		}
+		return err
+	}
+
+	// 检查 min/max 副本数是否需要更新
+	needsUpdate := false
+	if myApp.Spec.Autoscaling.MinReplicas != nil &&
+		(existing.Spec.MinReplicas == nil ||
+			*existing.Spec.MinReplicas != *myApp.Spec.Autoscaling.MinReplicas) {
+		existing.Spec.MinReplicas = myApp.Spec.Autoscaling.MinReplicas
+		needsUpdate = true
+	}
+	if myApp.Spec.Autoscaling.MaxReplicas != nil &&
+		existing.Spec.MaxReplicas != *myApp.Spec.Autoscaling.MaxReplicas {
+		existing.Spec.MaxReplicas = *myApp.Spec.Autoscaling.MaxReplicas
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		log.Info("updating hpa", "name", existing.Name)
+		return r.Update(ctx, &existing)
+	}
+
+	return nil
 }
 
 func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
@@ -167,13 +212,11 @@ func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.
 		return err
 	}
 
-	// 获取当前容器的镜像（取第一个容器）
 	currentImage := ""
 	if len(existing.Spec.Template.Spec.Containers) > 0 {
 		currentImage = existing.Spec.Template.Spec.Containers[0].Image
 	}
 
-	// 期望的镜像，如果用户没填就用默认值
 	desiredImage := myApp.Spec.Image
 	if desiredImage == "" {
 		desiredImage = "nginx:latest"
@@ -181,21 +224,14 @@ func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.
 
 	needsUpdate := false
 	if *existing.Spec.Replicas != myApp.Spec.Replicas {
-		log.Info("updating deployment replicas", "name", existing.Name)
 		existing.Spec.Replicas = &myApp.Spec.Replicas
 		needsUpdate = true
 	}
-
 	if currentImage != desiredImage {
-		log.Info("updating deployment image",
-			"name", existing.Name,
-			"from", currentImage,
-			"to", desiredImage,
-		)
+		log.Info("updating image", "from", currentImage, "to", desiredImage)
 		existing.Spec.Template.Spec.Containers[0].Image = desiredImage
 		needsUpdate = true
 	}
-
 	if needsUpdate {
 		return r.Update(ctx, &existing)
 	}
@@ -222,7 +258,6 @@ func (r *MyAppReconciler) reconcileService(ctx context.Context, myApp *appv1.MyA
 
 	if len(existing.Spec.Ports) > 0 &&
 		existing.Spec.Ports[0].Port != myApp.Spec.Port {
-		log.Info("updating service port", "name", existing.Name)
 		existing.Spec.Ports[0].Port = myApp.Spec.Port
 		existing.Spec.Ports[0].TargetPort = intstr.FromInt32(myApp.Spec.Port)
 		return r.Update(ctx, &existing)
@@ -238,6 +273,47 @@ func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, 
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+func buildHPA(myApp *appv1.MyApp, scheme *runtime.Scheme) *autoscalingv2.HorizontalPodAutoscaler {
+	as := myApp.Spec.Autoscaling
+
+	// 默认 CPU 目标 80%
+	cpuTarget := int32(80)
+	if as.TargetCPUUtilizationPercentage != nil {
+		cpuTarget = *as.TargetCPUUtilizationPercentage
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      myApp.Name + "-hpa",
+			Namespace: myApp.Namespace,
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       myApp.Name,
+			},
+			MinReplicas: as.MinReplicas,
+			MaxReplicas: *as.MaxReplicas,
+			Metrics: []autoscalingv2.MetricSpec{
+				{
+					Type: autoscalingv2.ResourceMetricSourceType,
+					Resource: &autoscalingv2.ResourceMetricSource{
+						Name: corev1.ResourceCPU,
+						Target: autoscalingv2.MetricTarget{
+							Type:               autoscalingv2.UtilizationMetricType,
+							AverageUtilization: &cpuTarget,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	controllerutil.SetControllerReference(myApp, hpa, scheme)
+	return hpa
 }
 
 func buildConfigMap(myApp *appv1.MyApp, scheme *runtime.Scheme) *corev1.ConfigMap {
@@ -291,6 +367,13 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 							Image:   image,
 							Ports:   []corev1.ContainerPort{{ContainerPort: myApp.Spec.Port}},
 							EnvFrom: envFrom,
+							// HPA 需要容器声明资源 requests，否则无法计算 CPU 利用率
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
 						},
 					},
 				},
@@ -333,6 +416,7 @@ func (r *MyAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Named("myapp").
 		Complete(r)
 }

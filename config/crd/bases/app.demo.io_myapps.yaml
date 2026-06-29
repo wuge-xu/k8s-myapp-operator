@@ -56,17 +56,40 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of MyApp
+            description: MyAppSpec defines the desired state of MyApp
             properties:
+              autoscaling:
+                description: autoscaling defines the autoscaling configuration
+                properties:
+                  enabled:
+                    description: enabled controls whether autoscaling is enabled
+                    type: boolean
+                  maxReplicas:
+                    description: maxReplicas is the maximum number of replicas
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minReplicas:
+                    description: minReplicas is the minimum number of replicas
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  targetCPUUtilizationPercentage:
+                    description: targetCPUUtilizationPercentage is the target CPU
+                      utilization percentage
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                type: object
               config:
                 additionalProperties:
                   type: string
-                description: config is a map of environment variables to inject into
-                  the application
+                description: config is a map of environment variables to inject
                 type: object
               image:
                 default: nginx:latest
-                description: image is the container image to use for this MyApp
+                description: image is the container image to use
                 type: string
               port:
                 description: port is the port that the application listens on
@@ -75,8 +98,7 @@ spec:
                 minimum: 1
                 type: integer
               replicas:
-                description: replicas is the desired number of pod replicas for this
-                  MyApp
+                description: replicas is the desired number of pod replicas
                 format: int32
                 minimum: 1
                 type: integer
@@ -85,7 +107,7 @@ spec:
             - replicas
             type: object
           status:
-            description: status defines the observed state of MyApp
+            description: MyAppStatus defines the observed state of MyApp.
             properties:
               conditions:
                 description: conditions represent the current state of the MyApp resource.
