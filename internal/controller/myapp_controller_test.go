@@ -54,6 +54,11 @@ var _ = Describe("MyApp Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
+					Spec: appv1.MyAppSpec{
+						Replicas: 1,
+						Port:     8080,
+						Image:    "nginx:1.27-alpine",
+					},
 					// TODO(user): Specify other spec details if needed.
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
