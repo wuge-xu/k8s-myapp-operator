@@ -15,6 +15,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"time"
 
@@ -24,11 +25,13 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -38,11 +41,14 @@ import (
 	appv1 "k8s-myapp-operator/api/v1"
 )
 
-const myAppFinalizer = "cleanup.app.demo.io"
+const (
+	myAppFinalizer = "cleanup.app.demo.io"
 
-// 定义三个 Prometheus 指标
-// Counter：只增不减的计数器，适合记录"发生了多少次"
-// Histogram：分布直方图，适合记录"耗时分布"
+	conditionTypeReady       = "Ready"
+	conditionTypeProgressing = "Progressing"
+	conditionTypeDegraded    = "Degraded"
+)
+
 var (
 	reconcileTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -71,14 +77,13 @@ var (
 )
 
 func init() {
-	// 把这三个指标注册到 controller-runtime 的默认注册表
-	// controller-runtime 的 /metrics 端点会自动暴露这个注册表里的所有指标
 	metrics.Registry.MustRegister(reconcileTotal, reconcileErrors, reconcileDuration)
 }
 
 type MyAppReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=app.demo.io,resources=myapps,verbs=get;list;watch;create;update;patch;delete
@@ -88,6 +93,7 @@ type MyAppReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -101,15 +107,12 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// 记录调谐次数
 	reconcileTotal.WithLabelValues(myApp.Name, myApp.Namespace).Inc()
 
 	var reconcileErr error
 	defer func() {
-		// 记录调谐耗时（无论成功还是失败都记录）
 		reconcileDuration.WithLabelValues(myApp.Name, myApp.Namespace).
 			Observe(time.Since(start).Seconds())
-		// 如果有错误，记录错误次数
 		if reconcileErr != nil {
 			reconcileErrors.WithLabelValues(myApp.Name, myApp.Namespace).Inc()
 		}
@@ -130,19 +133,39 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	if reconcileErr = r.reconcileConfigMap(ctx, &myApp, log); reconcileErr != nil {
-		return ctrl.Result{}, reconcileErr
+		return r.failReconcile(
+			ctx,
+			&myApp,
+			"ConfigMapReconcileFailed",
+			reconcileErr,
+		)
 	}
 
 	if reconcileErr = r.reconcileDeployment(ctx, &myApp, log); reconcileErr != nil {
-		return ctrl.Result{}, reconcileErr
+		return r.failReconcile(
+			ctx,
+			&myApp,
+			"DeploymentReconcileFailed",
+			reconcileErr,
+		)
 	}
 
 	if reconcileErr = r.reconcileService(ctx, &myApp, log); reconcileErr != nil {
-		return ctrl.Result{}, reconcileErr
+		return r.failReconcile(
+			ctx,
+			&myApp,
+			"ServiceReconcileFailed",
+			reconcileErr,
+		)
 	}
 
 	if reconcileErr = r.reconcileHPA(ctx, &myApp, log); reconcileErr != nil {
-		return ctrl.Result{}, reconcileErr
+		return r.failReconcile(
+			ctx,
+			&myApp,
+			"HPAReconcileFailed",
+			reconcileErr,
+		)
 	}
 
 	var existingDeployment appsv1.Deployment
@@ -150,20 +173,209 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		Name:      myApp.Name,
 		Namespace: myApp.Namespace,
 	}, &existingDeployment); reconcileErr != nil {
-		return ctrl.Result{}, reconcileErr
+		return r.failReconcile(
+			ctx,
+			&myApp,
+			"DeploymentStatusReadFailed",
+			reconcileErr,
+		)
+	}
+
+	desiredReplicas := int32(1)
+	if existingDeployment.Spec.Replicas != nil {
+		desiredReplicas = *existingDeployment.Spec.Replicas
 	}
 
 	readyReplicas := existingDeployment.Status.ReadyReplicas
-	phase := "Pending"
-	if readyReplicas == myApp.Spec.Replicas {
+
+	deploymentReady :=
+		existingDeployment.Status.ObservedGeneration >= existingDeployment.Generation &&
+			existingDeployment.Status.ReadyReplicas == desiredReplicas &&
+			existingDeployment.Status.UpdatedReplicas == desiredReplicas &&
+			existingDeployment.Status.AvailableReplicas == desiredReplicas
+
+	phase := "Progressing"
+
+	if deploymentReady {
 		phase = "Running"
-	} else if readyReplicas > 0 {
-		phase = "Degraded"
+
+		becameReady := r.setCondition(
+			&myApp,
+			conditionTypeReady,
+			metav1.ConditionTrue,
+			"AllReplicasReady",
+			fmt.Sprintf(
+				"All %d desired replicas are ready",
+				desiredReplicas,
+			),
+		)
+
+		r.setCondition(
+			&myApp,
+			conditionTypeProgressing,
+			metav1.ConditionFalse,
+			"ReconcileComplete",
+			"Application reconciliation completed",
+		)
+
+		r.setCondition(
+			&myApp,
+			conditionTypeDegraded,
+			metav1.ConditionFalse,
+			"ResourcesHealthy",
+			"All managed resources are healthy",
+		)
+
+		if becameReady {
+			r.recordEventf(
+				&myApp,
+				corev1.EventTypeNormal,
+				"Ready",
+				"MyApp is ready with %d/%d replicas",
+				readyReplicas,
+				desiredReplicas,
+			)
+		}
+	} else {
+		message := fmt.Sprintf(
+			"Waiting for replicas to become ready: %d/%d ready",
+			readyReplicas,
+			desiredReplicas,
+		)
+
+		r.setCondition(
+			&myApp,
+			conditionTypeReady,
+			metav1.ConditionFalse,
+			"ReplicasNotReady",
+			message,
+		)
+
+		r.setCondition(
+			&myApp,
+			conditionTypeProgressing,
+			metav1.ConditionTrue,
+			"WaitingForReplicas",
+			message,
+		)
+
+		r.setCondition(
+			&myApp,
+			conditionTypeDegraded,
+			metav1.ConditionFalse,
+			"ReconcileInProgress",
+			"Application resources are still progressing",
+		)
 	}
 
-	var result ctrl.Result
-	result, reconcileErr = r.updateStatus(ctx, &myApp, phase, readyReplicas)
-	return result, reconcileErr
+	if reconcileErr = r.updateStatus(ctx, &myApp, phase, readyReplicas); reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
+	}
+
+	if !deploymentReady {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// setCondition creates or updates one standard Kubernetes Condition.
+func (r *MyAppReconciler) setCondition(
+	myApp *appv1.MyApp,
+	conditionType string,
+	status metav1.ConditionStatus,
+	reason string,
+	message string,
+) bool {
+	return meta.SetStatusCondition(
+		&myApp.Status.Conditions,
+		metav1.Condition{
+			Type:               conditionType,
+			Status:             status,
+			ObservedGeneration: myApp.Generation,
+			Reason:             reason,
+			Message:            message,
+		},
+	)
+}
+
+// failReconcile records a failed reconciliation in both Status and Events.
+func (r *MyAppReconciler) failReconcile(
+	ctx context.Context,
+	myApp *appv1.MyApp,
+	reason string,
+	reconcileErr error,
+) (ctrl.Result, error) {
+	message := fmt.Sprintf("%s: %v", reason, reconcileErr)
+
+	r.setCondition(
+		myApp,
+		conditionTypeReady,
+		metav1.ConditionFalse,
+		reason,
+		message,
+	)
+
+	r.setCondition(
+		myApp,
+		conditionTypeProgressing,
+		metav1.ConditionFalse,
+		reason,
+		"Reconciliation stopped because an error occurred",
+	)
+
+	r.setCondition(
+		myApp,
+		conditionTypeDegraded,
+		metav1.ConditionTrue,
+		reason,
+		message,
+	)
+
+	if statusErr := r.updateStatus(
+		ctx,
+		myApp,
+		"Degraded",
+		myApp.Status.ReadyReplicas,
+	); statusErr != nil {
+		return ctrl.Result{}, fmt.Errorf(
+			"%s; failed to persist degraded status: %w",
+			message,
+			statusErr,
+		)
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeWarning,
+		reason,
+		"%v",
+		reconcileErr,
+	)
+
+	return ctrl.Result{}, reconcileErr
+}
+
+// recordEventf safely records an Event.
+// Recorder can be nil in lightweight unit tests.
+func (r *MyAppReconciler) recordEventf(
+	myApp *appv1.MyApp,
+	eventType string,
+	reason string,
+	messageFmt string,
+	args ...interface{},
+) {
+	if r.Recorder == nil {
+		return
+	}
+
+	r.Recorder.Eventf(
+		myApp,
+		eventType,
+		reason,
+		messageFmt,
+		args...,
+	)
 }
 
 func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) (ctrl.Result, error) {
@@ -171,6 +383,8 @@ func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp
 		return ctrl.Result{}, nil
 	}
 	log.Info("executing cleanup before deletion", "name", myApp.Name)
+	r.recordEventf(myApp, corev1.EventTypeNormal, "Deleting",
+		"MyApp %s is being deleted, running cleanup", myApp.Name)
 	controllerutil.RemoveFinalizer(myApp, myAppFinalizer)
 	if err := r.Update(ctx, myApp); err != nil {
 		return ctrl.Result{}, err
@@ -195,6 +409,8 @@ func (r *MyAppReconciler) reconcileHPA(ctx context.Context, myApp *appv1.MyApp, 
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating hpa", "name", desired.Name)
+			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedHPA",
+				"Created HPA %s", desired.Name)
 			return r.Create(ctx, desired)
 		}
 		return err
@@ -236,6 +452,8 @@ func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.M
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating configmap", "name", desired.Name)
+			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedConfigMap",
+				"Created ConfigMap %s", desired.Name)
 			return r.Create(ctx, desired)
 		}
 		return err
@@ -243,6 +461,8 @@ func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.M
 
 	if !reflect.DeepEqual(existing.Data, myApp.Spec.Config) {
 		log.Info("updating configmap", "name", existing.Name)
+		r.recordEventf(myApp, corev1.EventTypeNormal, "UpdatedConfigMap",
+			"Updated ConfigMap %s", existing.Name)
 		existing.Data = myApp.Spec.Config
 		return r.Update(ctx, &existing)
 	}
@@ -262,6 +482,8 @@ func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating deployment", "name", desired.Name)
+			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedDeployment",
+				"Created Deployment %s with %d replicas", desired.Name, myApp.Spec.Replicas)
 			return r.Create(ctx, desired)
 		}
 		return err
@@ -279,11 +501,16 @@ func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.
 
 	needsUpdate := false
 	if *existing.Spec.Replicas != myApp.Spec.Replicas {
+		r.recordEventf(myApp, corev1.EventTypeNormal, "Scaling",
+			"Scaling Deployment from %d to %d replicas",
+			*existing.Spec.Replicas, myApp.Spec.Replicas)
 		existing.Spec.Replicas = &myApp.Spec.Replicas
 		needsUpdate = true
 	}
 	if currentImage != desiredImage {
 		log.Info("updating image", "from", currentImage, "to", desiredImage)
+		r.recordEventf(myApp, corev1.EventTypeNormal, "ImageUpdated",
+			"Updated container image from %s to %s", currentImage, desiredImage)
 		existing.Spec.Template.Spec.Containers[0].Image = desiredImage
 		needsUpdate = true
 	}
@@ -306,6 +533,8 @@ func (r *MyAppReconciler) reconcileService(ctx context.Context, myApp *appv1.MyA
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating service", "name", desired.Name)
+			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedService",
+				"Created Service %s on port %d", desired.Name, myApp.Spec.Port)
 			return r.Create(ctx, desired)
 		}
 		return err
@@ -313,6 +542,8 @@ func (r *MyAppReconciler) reconcileService(ctx context.Context, myApp *appv1.MyA
 
 	if len(existing.Spec.Ports) > 0 &&
 		existing.Spec.Ports[0].Port != myApp.Spec.Port {
+		r.recordEventf(myApp, corev1.EventTypeNormal, "UpdatedService",
+			"Updated Service port to %d", myApp.Spec.Port)
 		existing.Spec.Ports[0].Port = myApp.Spec.Port
 		existing.Spec.Ports[0].TargetPort = intstr.FromInt32(myApp.Spec.Port)
 		return r.Update(ctx, &existing)
@@ -321,13 +552,17 @@ func (r *MyAppReconciler) reconcileService(ctx context.Context, myApp *appv1.MyA
 	return nil
 }
 
-func (r *MyAppReconciler) updateStatus(ctx context.Context, myApp *appv1.MyApp, phase string, readyReplicas int32) (ctrl.Result, error) {
+func (r *MyAppReconciler) updateStatus(
+	ctx context.Context,
+	myApp *appv1.MyApp,
+	phase string,
+	readyReplicas int32,
+) error {
 	myApp.Status.Phase = phase
+	myApp.Status.ObservedGeneration = myApp.Generation
 	myApp.Status.ReadyReplicas = readyReplicas
-	if err := r.Status().Update(ctx, myApp); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, nil
+
+	return r.Status().Update(ctx, myApp)
 }
 
 func buildHPA(myApp *appv1.MyApp, scheme *runtime.Scheme) *autoscalingv2.HorizontalPodAutoscaler {

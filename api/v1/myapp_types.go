@@ -74,7 +74,11 @@ type MyAppStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// readyReplicas is the number of pods that are ready
+	// observedGeneration is the latest MyApp generation processed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// readyReplicas is the number of pods that are ready.
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
