@@ -21,11 +21,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	appv1 "k8s-myapp-operator/api/v1"
 )
@@ -43,11 +43,17 @@ var _ = Describe("MyApp Controller", func() {
 			Name:      resourceName,
 			Namespace: resourceNamespace,
 		}
-		myapp := &appv1.MyApp{}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind MyApp")
-			err := k8sClient.Get(ctx, typeNamespacedName, myapp)
+			By("creating the MyApp custom resource")
+
+			var existing appv1.MyApp
+			err := k8sClient.Get(
+				ctx,
+				typeNamespacedName,
+				&existing,
+			)
+
 			if err != nil && errors.IsNotFound(err) {
 				resource := &appv1.MyApp{
 					ObjectMeta: metav1.ObjectMeta{
@@ -58,35 +64,209 @@ var _ = Describe("MyApp Controller", func() {
 						Replicas: 1,
 						Port:     8080,
 						Image:    "nginx:1.27-alpine",
+						Config: map[string]string{
+							"APP_MODE": "test",
+						},
 					},
-					// TODO(user): Specify other spec details if needed.
 				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				Expect(
+					k8sClient.Create(ctx, resource),
+				).To(Succeed())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &appv1.MyApp{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			var resource appv1.MyApp
+
+			err := k8sClient.Get(
+				ctx,
+				typeNamespacedName,
+				&resource,
+			)
+
+			if errors.IsNotFound(err) {
+				return
+			}
+
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Cleanup the specific resource instance MyApp")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			// Avoid leaving the test resource in Terminating because the
+			// controller adds a finalizer during reconciliation.
+			if len(resource.Finalizers) > 0 {
+				resource.Finalizers = nil
+				Expect(
+					k8sClient.Update(ctx, &resource),
+				).To(Succeed())
+			}
+
+			Expect(
+				k8sClient.Delete(ctx, &resource),
+			).To(Succeed())
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
+
+		It("should create and self-heal the managed Deployment", func() {
 			controllerReconciler := &MyAppReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
+			By("reconciling the MyApp resource")
+
+			_, err := controllerReconciler.Reconcile(
+				ctx,
+				reconcile.Request{
+					NamespacedName: typeNamespacedName,
+				},
+			)
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			deploymentKey := types.NamespacedName{
+				Name:      resourceName,
+				Namespace: resourceNamespace,
+			}
+
+			var deployment appsv1.Deployment
+			Expect(
+				k8sClient.Get(
+					ctx,
+					deploymentKey,
+					&deployment,
+				),
+			).To(Succeed())
+
+			By("verifying the initially created Deployment")
+
+			Expect(deployment.Spec.Replicas).NotTo(BeNil())
+			Expect(
+				*deployment.Spec.Replicas,
+			).To(Equal(int32(1)))
+
+			Expect(
+				deployment.Spec.Template.Spec.Containers,
+			).To(HaveLen(1))
+
+			container := deployment.Spec.Template.Spec.Containers[0]
+
+			Expect(
+				container.Image,
+			).To(Equal("nginx:1.27-alpine"))
+
+			Expect(container.Ports).To(HaveLen(1))
+			Expect(
+				container.Ports[0].ContainerPort,
+			).To(Equal(int32(8080)))
+
+			Expect(container.EnvFrom).To(HaveLen(1))
+			Expect(
+				container.EnvFrom[0].ConfigMapRef,
+			).NotTo(BeNil())
+			Expect(
+				container.EnvFrom[0].ConfigMapRef.Name,
+			).To(Equal(resourceName + "-config"))
+
+			Expect(
+				deployment.Spec.Template.Labels["app"],
+			).To(Equal(resourceName))
+
+			Expect(deployment.OwnerReferences).To(HaveLen(1))
+			Expect(
+				deployment.OwnerReferences[0].Name,
+			).To(Equal(resourceName))
+
+			By("manually introducing Deployment drift")
+
+			driftedReplicas := int32(5)
+			deployment.Spec.Replicas = &driftedReplicas
+
+			deployment.Labels = map[string]string{
+				"app": "manually-changed",
+			}
+
+			// Keep the selector label valid and add a separate drift label.
+			deployment.Spec.Template.Labels = map[string]string{
+				"app":          resourceName,
+				"manual-drift": "true",
+			}
+
+			deployment.Spec.Template.Spec.
+				Containers[0].Image = "busybox:latest"
+
+			deployment.Spec.Template.Spec.
+				Containers[0].Ports = nil
+
+			deployment.Spec.Template.Spec.
+				Containers[0].EnvFrom = nil
+
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			}
+
+			Expect(
+				k8sClient.Update(ctx, &deployment),
+			).To(Succeed())
+
+			By("reconciling again to repair the drift")
+
+			_, err = controllerReconciler.Reconcile(
+				ctx,
+				reconcile.Request{
+					NamespacedName: typeNamespacedName,
+				},
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			var healedDeployment appsv1.Deployment
+			Expect(
+				k8sClient.Get(
+					ctx,
+					deploymentKey,
+					&healedDeployment,
+				),
+			).To(Succeed())
+
+			By("verifying the Deployment was restored")
+
+			Expect(healedDeployment.Spec.Replicas).NotTo(BeNil())
+			Expect(
+				*healedDeployment.Spec.Replicas,
+			).To(Equal(int32(1)))
+
+			Expect(
+				healedDeployment.Labels["app"],
+			).To(Equal(resourceName))
+
+			Expect(
+				healedDeployment.Spec.Template.Labels,
+			).To(Equal(map[string]string{
+				"app": resourceName,
+			}))
+
+			healedContainer :=
+				healedDeployment.Spec.Template.Spec.Containers[0]
+
+			Expect(
+				healedContainer.Image,
+			).To(Equal("nginx:1.27-alpine"))
+
+			Expect(healedContainer.Ports).To(HaveLen(1))
+			Expect(
+				healedContainer.Ports[0].ContainerPort,
+			).To(Equal(int32(8080)))
+
+			Expect(healedContainer.EnvFrom).To(HaveLen(1))
+			Expect(
+				healedContainer.EnvFrom[0].ConfigMapRef,
+			).NotTo(BeNil())
+			Expect(
+				healedContainer.EnvFrom[0].ConfigMapRef.Name,
+			).To(Equal(resourceName + "-config"))
+
+			Expect(
+				healedDeployment.Spec.Strategy.Type,
+			).To(Equal(
+				appsv1.RollingUpdateDeploymentStrategyType,
+			))
 		})
 	})
 })
