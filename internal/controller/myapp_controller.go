@@ -470,7 +470,11 @@ func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.M
 	return nil
 }
 
-func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
+func (r *MyAppReconciler) reconcileDeployment(
+	ctx context.Context,
+	myApp *appv1.MyApp,
+	log logr.Logger,
+) error {
 	desired := buildDeployment(myApp, r.Scheme)
 
 	var existing appsv1.Deployment
@@ -482,41 +486,122 @@ func (r *MyAppReconciler) reconcileDeployment(ctx context.Context, myApp *appv1.
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating deployment", "name", desired.Name)
-			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedDeployment",
-				"Created Deployment %s with %d replicas", desired.Name, myApp.Spec.Replicas)
+			r.recordEventf(
+				myApp,
+				corev1.EventTypeNormal,
+				"CreatedDeployment",
+				"Created Deployment %s with %d replicas",
+				desired.Name,
+				myApp.Spec.Replicas,
+			)
 			return r.Create(ctx, desired)
 		}
 		return err
 	}
 
-	currentImage := ""
-	if len(existing.Spec.Template.Spec.Containers) > 0 {
-		currentImage = existing.Spec.Template.Spec.Containers[0].Image
+	driftFields := make([]string, 0)
+
+	// When HPA is enabled, replicas are controlled by HPA. Enforcing
+	// MyApp.spec.replicas here would cause the two controllers to conflict.
+	autoscalingEnabled :=
+		myApp.Spec.Autoscaling != nil &&
+			myApp.Spec.Autoscaling.Enabled
+
+	if !autoscalingEnabled &&
+		(existing.Spec.Replicas == nil ||
+			*existing.Spec.Replicas != *desired.Spec.Replicas) {
+		existing.Spec.Replicas = desired.Spec.Replicas
+		driftFields = append(driftFields, "replicas")
 	}
 
-	desiredImage := myApp.Spec.Image
-	if desiredImage == "" {
-		desiredImage = "nginx:latest"
+	if !reflect.DeepEqual(existing.Labels, desired.Labels) {
+		existing.Labels = desired.Labels
+		driftFields = append(driftFields, "deploymentLabels")
 	}
 
-	needsUpdate := false
-	if *existing.Spec.Replicas != myApp.Spec.Replicas {
-		r.recordEventf(myApp, corev1.EventTypeNormal, "Scaling",
-			"Scaling Deployment from %d to %d replicas",
-			*existing.Spec.Replicas, myApp.Spec.Replicas)
-		existing.Spec.Replicas = &myApp.Spec.Replicas
-		needsUpdate = true
+	if !reflect.DeepEqual(
+		existing.Spec.Template.Labels,
+		desired.Spec.Template.Labels,
+	) {
+		existing.Spec.Template.Labels = desired.Spec.Template.Labels
+		driftFields = append(driftFields, "podLabels")
 	}
-	if currentImage != desiredImage {
-		log.Info("updating image", "from", currentImage, "to", desiredImage)
-		r.recordEventf(myApp, corev1.EventTypeNormal, "ImageUpdated",
-			"Updated container image from %s to %s", currentImage, desiredImage)
-		existing.Spec.Template.Spec.Containers[0].Image = desiredImage
-		needsUpdate = true
+
+	if !reflect.DeepEqual(
+		existing.Spec.Strategy,
+		desired.Spec.Strategy,
+	) {
+		existing.Spec.Strategy = desired.Spec.Strategy
+		driftFields = append(driftFields, "strategy")
 	}
-	if needsUpdate {
-		return r.Update(ctx, &existing)
+
+	desiredContainers := desired.Spec.Template.Spec.Containers
+
+	if len(existing.Spec.Template.Spec.Containers) == 0 {
+		existing.Spec.Template.Spec.Containers = desiredContainers
+		driftFields = append(driftFields, "containers")
+	} else {
+		currentContainer := &existing.Spec.Template.Spec.Containers[0]
+		desiredContainer := desiredContainers[0]
+
+		if currentContainer.Name != desiredContainer.Name {
+			currentContainer.Name = desiredContainer.Name
+			driftFields = append(driftFields, "containerName")
+		}
+
+		if currentContainer.Image != desiredContainer.Image {
+			currentContainer.Image = desiredContainer.Image
+			driftFields = append(driftFields, "image")
+		}
+
+		if !reflect.DeepEqual(
+			currentContainer.Ports,
+			desiredContainer.Ports,
+		) {
+			currentContainer.Ports = desiredContainer.Ports
+			driftFields = append(driftFields, "containerPorts")
+		}
+
+		if !reflect.DeepEqual(
+			currentContainer.EnvFrom,
+			desiredContainer.EnvFrom,
+		) {
+			currentContainer.EnvFrom = desiredContainer.EnvFrom
+			driftFields = append(driftFields, "envFrom")
+		}
+
+		if !reflect.DeepEqual(
+			currentContainer.Resources,
+			desiredContainer.Resources,
+		) {
+			currentContainer.Resources = desiredContainer.Resources
+			driftFields = append(driftFields, "resources")
+		}
 	}
+
+	if len(driftFields) == 0 {
+		return nil
+	}
+
+	log.Info(
+		"correcting deployment drift",
+		"name",
+		existing.Name,
+		"fields",
+		driftFields,
+	)
+
+	if err := r.Update(ctx, &existing); err != nil {
+		return err
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeNormal,
+		"DeploymentDriftCorrected",
+		"Corrected Deployment drift in fields: %v",
+		driftFields,
+	)
 
 	return nil
 }
@@ -616,9 +701,14 @@ func buildConfigMap(myApp *appv1.MyApp, scheme *runtime.Scheme) *corev1.ConfigMa
 	return cm
 }
 
-func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deployment {
+func buildDeployment(
+	myApp *appv1.MyApp,
+	scheme *runtime.Scheme,
+) *appsv1.Deployment {
 	replicas := myApp.Spec.Replicas
-	labels := map[string]string{"app": myApp.Name}
+	labels := map[string]string{
+		"app": myApp.Name,
+	}
 
 	image := myApp.Spec.Image
 	if image == "" {
@@ -638,27 +728,51 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 		}
 	}
 
+	maxUnavailable := intstr.FromString("25%")
+	maxSurge := intstr.FromString("25%")
+
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      myApp.Name,
 			Namespace: myApp.Namespace,
+			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: &maxUnavailable,
+					MaxSurge:       &maxSurge,
+				},
+			},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:    "app",
-							Image:   image,
-							Ports:   []corev1.ContainerPort{{ContainerPort: myApp.Spec.Port}},
+							Name:  "app",
+							Image: image,
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: myApp.Spec.Port,
+									Protocol:      corev1.ProtocolTCP,
+								},
+							},
 							EnvFrom: envFrom,
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("100m"),
-									corev1.ResourceMemory: resource.MustParse("128Mi"),
+									corev1.ResourceCPU: resource.MustParse(
+										"100m",
+									),
+									corev1.ResourceMemory: resource.MustParse(
+										"128Mi",
+									),
 								},
 							},
 						},
@@ -668,7 +782,12 @@ func buildDeployment(myApp *appv1.MyApp, scheme *runtime.Scheme) *appsv1.Deploym
 		},
 	}
 
-	controllerutil.SetControllerReference(myApp, deployment, scheme)
+	controllerutil.SetControllerReference(
+		myApp,
+		deployment,
+		scheme,
+	)
+
 	return deployment
 }
 
