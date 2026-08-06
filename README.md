@@ -67,3 +67,7 @@ Deployment 的副本数会自动同步为5，无需手动操作。
 ## 开发与测试环境
 
 本项目在 WSL2 + K3s 单节点集群上开发和验证。
+
+## Validation
+
+- [Deployment drift detection and self-healing](docs/deployment-self-healing-validation.md)
