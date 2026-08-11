@@ -299,14 +299,24 @@ func (r *MyAppReconciler) setCondition(
 	)
 }
 
-// failReconcile records a failed reconciliation in both Status and Events.
+// failReconcile records a failed reconciliation in Status and Events and
+// applies an explicit retry policy. Returning nil error for classified errors
+// prevents controller-runtime from replacing our RequeueAfter with its own
+// rate-limited error retry.
 func (r *MyAppReconciler) failReconcile(
 	ctx context.Context,
 	myApp *appv1.MyApp,
 	reason string,
 	reconcileErr error,
 ) (ctrl.Result, error) {
-	message := fmt.Sprintf("%s: %v", reason, reconcileErr)
+	decision := classifyReconcileError(reconcileErr)
+	message := fmt.Sprintf(
+		"%s: %v (class=%s, policyReason=%s)",
+		reason,
+		reconcileErr,
+		decision.Class,
+		decision.Reason,
+	)
 
 	r.setCondition(
 		myApp,
@@ -349,11 +359,32 @@ func (r *MyAppReconciler) failReconcile(
 		myApp,
 		corev1.EventTypeWarning,
 		reason,
-		"%v",
-		reconcileErr,
+		"%s",
+		message,
 	)
 
-	return ctrl.Result{}, reconcileErr
+	if decision.Retry {
+		r.recordEventf(
+			myApp,
+			corev1.EventTypeWarning,
+			"RetryScheduled",
+			"Retry scheduled after %s because of %s",
+			decision.After,
+			decision.Reason,
+		)
+
+		return ctrl.Result{RequeueAfter: decision.After}, nil
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeWarning,
+		"RetrySuppressed",
+		"Automatic retry suppressed for permanent error: %s",
+		decision.Reason,
+	)
+
+	return ctrl.Result{}, nil
 }
 
 // recordEventf safely records an Event.
@@ -394,78 +425,203 @@ func (r *MyAppReconciler) handleDeletion(ctx context.Context, myApp *appv1.MyApp
 }
 
 func (r *MyAppReconciler) reconcileHPA(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
-	if myApp.Spec.Autoscaling == nil || !myApp.Spec.Autoscaling.Enabled {
+	key := types.NamespacedName{
+		Name:      myApp.Name + "-hpa",
+		Namespace: myApp.Namespace,
+	}
+
+	var existing autoscalingv2.HorizontalPodAutoscaler
+	err := r.Get(ctx, key, &existing)
+
+	autoscalingEnabled :=
+		myApp.Spec.Autoscaling != nil &&
+			myApp.Spec.Autoscaling.Enabled
+
+	if !autoscalingEnabled {
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+
+		log.Info("deleting hpa because autoscaling is disabled", "name", existing.Name)
+		if err := r.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		r.recordEventf(
+			myApp,
+			corev1.EventTypeNormal,
+			"DeletedHPA",
+			"Deleted HPA %s because autoscaling is disabled",
+			existing.Name,
+		)
 		return nil
 	}
 
 	desired := buildHPA(myApp, r.Scheme)
 
-	var existing autoscalingv2.HorizontalPodAutoscaler
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      myApp.Name + "-hpa",
-		Namespace: myApp.Namespace,
-	}, &existing)
-
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating hpa", "name", desired.Name)
-			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedHPA",
-				"Created HPA %s", desired.Name)
+			r.recordEventf(
+				myApp,
+				corev1.EventTypeNormal,
+				"CreatedHPA",
+				"Created HPA %s",
+				desired.Name,
+			)
 			return r.Create(ctx, desired)
 		}
 		return err
 	}
 
-	needsUpdate := false
-	if myApp.Spec.Autoscaling.MinReplicas != nil &&
-		(existing.Spec.MinReplicas == nil ||
-			*existing.Spec.MinReplicas != *myApp.Spec.Autoscaling.MinReplicas) {
-		existing.Spec.MinReplicas = myApp.Spec.Autoscaling.MinReplicas
-		needsUpdate = true
+	driftFields := make([]string, 0)
+
+	if !reflect.DeepEqual(
+		existing.Spec.ScaleTargetRef,
+		desired.Spec.ScaleTargetRef,
+	) {
+		existing.Spec.ScaleTargetRef = desired.Spec.ScaleTargetRef
+		driftFields = append(driftFields, "scaleTargetRef")
 	}
-	if myApp.Spec.Autoscaling.MaxReplicas != nil &&
-		existing.Spec.MaxReplicas != *myApp.Spec.Autoscaling.MaxReplicas {
-		existing.Spec.MaxReplicas = *myApp.Spec.Autoscaling.MaxReplicas
-		needsUpdate = true
+
+	if !reflect.DeepEqual(
+		existing.Spec.MinReplicas,
+		desired.Spec.MinReplicas,
+	) {
+		existing.Spec.MinReplicas = desired.Spec.MinReplicas
+		driftFields = append(driftFields, "minReplicas")
 	}
-	if needsUpdate {
-		log.Info("updating hpa", "name", existing.Name)
-		return r.Update(ctx, &existing)
+
+	if existing.Spec.MaxReplicas != desired.Spec.MaxReplicas {
+		existing.Spec.MaxReplicas = desired.Spec.MaxReplicas
+		driftFields = append(driftFields, "maxReplicas")
 	}
+
+	if !reflect.DeepEqual(existing.Spec.Metrics, desired.Spec.Metrics) {
+		existing.Spec.Metrics = desired.Spec.Metrics
+		driftFields = append(driftFields, "metrics")
+	}
+
+	if len(driftFields) == 0 {
+		return nil
+	}
+
+	log.Info(
+		"correcting hpa drift",
+		"name",
+		existing.Name,
+		"fields",
+		driftFields,
+	)
+
+	if err := r.Update(ctx, &existing); err != nil {
+		return err
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeNormal,
+		"HPADriftCorrected",
+		"Corrected HPA drift in fields: %v",
+		driftFields,
+	)
 
 	return nil
 }
 
 func (r *MyAppReconciler) reconcileConfigMap(ctx context.Context, myApp *appv1.MyApp, log logr.Logger) error {
+	key := types.NamespacedName{
+		Name:      myApp.Name + "-config",
+		Namespace: myApp.Namespace,
+	}
+
+	var existing corev1.ConfigMap
+	err := r.Get(ctx, key, &existing)
+
 	if len(myApp.Spec.Config) == 0 {
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+
+		log.Info(
+			"deleting configmap because config is empty",
+			"name",
+			existing.Name,
+		)
+
+		if err := r.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		r.recordEventf(
+			myApp,
+			corev1.EventTypeNormal,
+			"DeletedConfigMap",
+			"Deleted ConfigMap %s because MyApp config is empty",
+			existing.Name,
+		)
+
 		return nil
 	}
 
 	desired := buildConfigMap(myApp, r.Scheme)
 
-	var existing corev1.ConfigMap
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      myApp.Name + "-config",
-		Namespace: myApp.Namespace,
-	}, &existing)
-
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating configmap", "name", desired.Name)
-			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedConfigMap",
-				"Created ConfigMap %s", desired.Name)
+			r.recordEventf(
+				myApp,
+				corev1.EventTypeNormal,
+				"CreatedConfigMap",
+				"Created ConfigMap %s",
+				desired.Name,
+			)
 			return r.Create(ctx, desired)
 		}
 		return err
 	}
 
-	if !reflect.DeepEqual(existing.Data, myApp.Spec.Config) {
-		log.Info("updating configmap", "name", existing.Name)
-		r.recordEventf(myApp, corev1.EventTypeNormal, "UpdatedConfigMap",
-			"Updated ConfigMap %s", existing.Name)
-		existing.Data = myApp.Spec.Config
-		return r.Update(ctx, &existing)
+	driftFields := make([]string, 0)
+
+	if !reflect.DeepEqual(existing.Data, desired.Data) {
+		existing.Data = desired.Data
+		driftFields = append(driftFields, "data")
 	}
+
+	if !reflect.DeepEqual(existing.Labels, desired.Labels) {
+		existing.Labels = desired.Labels
+		driftFields = append(driftFields, "labels")
+	}
+
+	if len(driftFields) == 0 {
+		return nil
+	}
+
+	log.Info(
+		"correcting configmap drift",
+		"name",
+		existing.Name,
+		"fields",
+		driftFields,
+	)
+
+	if err := r.Update(ctx, &existing); err != nil {
+		return err
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeNormal,
+		"ConfigMapDriftCorrected",
+		"Corrected ConfigMap drift in fields: %v",
+		driftFields,
+	)
 
 	return nil
 }
@@ -618,21 +774,59 @@ func (r *MyAppReconciler) reconcileService(ctx context.Context, myApp *appv1.MyA
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating service", "name", desired.Name)
-			r.recordEventf(myApp, corev1.EventTypeNormal, "CreatedService",
-				"Created Service %s on port %d", desired.Name, myApp.Spec.Port)
+			r.recordEventf(
+				myApp,
+				corev1.EventTypeNormal,
+				"CreatedService",
+				"Created Service %s on port %d",
+				desired.Name,
+				myApp.Spec.Port,
+			)
 			return r.Create(ctx, desired)
 		}
 		return err
 	}
 
-	if len(existing.Spec.Ports) > 0 &&
-		existing.Spec.Ports[0].Port != myApp.Spec.Port {
-		r.recordEventf(myApp, corev1.EventTypeNormal, "UpdatedService",
-			"Updated Service port to %d", myApp.Spec.Port)
-		existing.Spec.Ports[0].Port = myApp.Spec.Port
-		existing.Spec.Ports[0].TargetPort = intstr.FromInt32(myApp.Spec.Port)
-		return r.Update(ctx, &existing)
+	driftFields := make([]string, 0)
+
+	if !reflect.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
+		existing.Spec.Selector = desired.Spec.Selector
+		driftFields = append(driftFields, "selector")
 	}
+
+	if !reflect.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) {
+		existing.Spec.Ports = desired.Spec.Ports
+		driftFields = append(driftFields, "ports")
+	}
+
+	if !reflect.DeepEqual(existing.Labels, desired.Labels) {
+		existing.Labels = desired.Labels
+		driftFields = append(driftFields, "labels")
+	}
+
+	if len(driftFields) == 0 {
+		return nil
+	}
+
+	log.Info(
+		"correcting service drift",
+		"name",
+		existing.Name,
+		"fields",
+		driftFields,
+	)
+
+	if err := r.Update(ctx, &existing); err != nil {
+		return err
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeNormal,
+		"ServiceDriftCorrected",
+		"Corrected Service drift in fields: %v",
+		driftFields,
+	)
 
 	return nil
 }
@@ -652,15 +846,35 @@ func (r *MyAppReconciler) updateStatus(
 
 func buildHPA(myApp *appv1.MyApp, scheme *runtime.Scheme) *autoscalingv2.HorizontalPodAutoscaler {
 	as := myApp.Spec.Autoscaling
+
+	minReplicas := int32(1)
+	if as != nil && as.MinReplicas != nil {
+		minReplicas = *as.MinReplicas
+	}
+
+	maxReplicas := int32(3)
+	if as != nil && as.MaxReplicas != nil {
+		maxReplicas = *as.MaxReplicas
+	}
+	if maxReplicas < minReplicas {
+		maxReplicas = minReplicas
+	}
+
 	cpuTarget := int32(80)
-	if as.TargetCPUUtilizationPercentage != nil {
+	if as != nil && as.TargetCPUUtilizationPercentage != nil {
 		cpuTarget = *as.TargetCPUUtilizationPercentage
+	}
+
+	labels := map[string]string{
+		"app":                          myApp.Name,
+		"app.kubernetes.io/managed-by": "myapp-operator",
 	}
 
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      myApp.Name + "-hpa",
 			Namespace: myApp.Namespace,
+			Labels:    labels,
 		},
 		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
 			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
@@ -668,8 +882,8 @@ func buildHPA(myApp *appv1.MyApp, scheme *runtime.Scheme) *autoscalingv2.Horizon
 				Kind:       "Deployment",
 				Name:       myApp.Name,
 			},
-			MinReplicas: as.MinReplicas,
-			MaxReplicas: *as.MaxReplicas,
+			MinReplicas: &minReplicas,
+			MaxReplicas: maxReplicas,
 			Metrics: []autoscalingv2.MetricSpec{
 				{
 					Type: autoscalingv2.ResourceMetricSourceType,
@@ -690,13 +904,20 @@ func buildHPA(myApp *appv1.MyApp, scheme *runtime.Scheme) *autoscalingv2.Horizon
 }
 
 func buildConfigMap(myApp *appv1.MyApp, scheme *runtime.Scheme) *corev1.ConfigMap {
+	labels := map[string]string{
+		"app":                          myApp.Name,
+		"app.kubernetes.io/managed-by": "myapp-operator",
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      myApp.Name + "-config",
 			Namespace: myApp.Namespace,
+			Labels:    labels,
 		},
 		Data: myApp.Spec.Config,
 	}
+
 	controllerutil.SetControllerReference(myApp, cm, scheme)
 	return cm
 }
@@ -792,17 +1013,24 @@ func buildDeployment(
 }
 
 func buildService(myApp *appv1.MyApp, scheme *runtime.Scheme) *corev1.Service {
-	labels := map[string]string{"app": myApp.Name}
+	labels := map[string]string{
+		"app":                          myApp.Name,
+		"app.kubernetes.io/managed-by": "myapp-operator",
+	}
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      myApp.Name + "-service",
 			Namespace: myApp.Namespace,
+			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: map[string]string{
+				"app": myApp.Name,
+			},
 			Ports: []corev1.ServicePort{
 				{
+					Name:       "http",
 					Port:       myApp.Spec.Port,
 					TargetPort: intstr.FromInt32(myApp.Spec.Port),
 					Protocol:   corev1.ProtocolTCP,
