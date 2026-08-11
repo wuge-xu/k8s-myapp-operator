@@ -299,14 +299,24 @@ func (r *MyAppReconciler) setCondition(
 	)
 }
 
-// failReconcile records a failed reconciliation in both Status and Events.
+// failReconcile records a failed reconciliation in Status and Events and
+// applies an explicit retry policy. Returning nil error for classified errors
+// prevents controller-runtime from replacing our RequeueAfter with its own
+// rate-limited error retry.
 func (r *MyAppReconciler) failReconcile(
 	ctx context.Context,
 	myApp *appv1.MyApp,
 	reason string,
 	reconcileErr error,
 ) (ctrl.Result, error) {
-	message := fmt.Sprintf("%s: %v", reason, reconcileErr)
+	decision := classifyReconcileError(reconcileErr)
+	message := fmt.Sprintf(
+		"%s: %v (class=%s, policyReason=%s)",
+		reason,
+		reconcileErr,
+		decision.Class,
+		decision.Reason,
+	)
 
 	r.setCondition(
 		myApp,
@@ -349,11 +359,32 @@ func (r *MyAppReconciler) failReconcile(
 		myApp,
 		corev1.EventTypeWarning,
 		reason,
-		"%v",
-		reconcileErr,
+		"%s",
+		message,
 	)
 
-	return ctrl.Result{}, reconcileErr
+	if decision.Retry {
+		r.recordEventf(
+			myApp,
+			corev1.EventTypeWarning,
+			"RetryScheduled",
+			"Retry scheduled after %s because of %s",
+			decision.After,
+			decision.Reason,
+		)
+
+		return ctrl.Result{RequeueAfter: decision.After}, nil
+	}
+
+	r.recordEventf(
+		myApp,
+		corev1.EventTypeWarning,
+		"RetrySuppressed",
+		"Automatic retry suppressed for permanent error: %s",
+		decision.Reason,
+	)
+
+	return ctrl.Result{}, nil
 }
 
 // recordEventf safely records an Event.
