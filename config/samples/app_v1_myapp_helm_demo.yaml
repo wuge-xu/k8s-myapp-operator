@@ -1,0 +1,17 @@
+apiVersion: app.demo.io/v1
+kind: MyApp
+metadata:
+  name: helm-demo
+  namespace: myapp-demo
+spec:
+  replicas: 2
+  image: nginx:1.27-alpine
+  port: 80
+  config:
+    APP_ENV: helm-validation
+    DELIVERY_MODE: helm
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 60
