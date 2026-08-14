@@ -1,0 +1,69 @@
+name: Delivery Gate
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  delivery:
+    permissions:
+      contents: read
+    name: Helm and Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check repository whitespace
+        run: git diff --check
+
+      - name: Install Helm
+        env:
+          HELM_VERSION: v3.21.2
+        run: |
+          curl -fsSLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          tar -xzf "helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+          helm version
+
+      - name: Lint Helm chart
+        run: helm lint charts/myapp-operator
+
+      - name: Render Helm chart
+        run: |
+          helm template myapp-operator \
+            charts/myapp-operator \
+            --namespace myapp-operator-system \
+            --include-crds \
+            > /tmp/myapp-operator-rendered.yaml
+
+      - name: Verify rendered resources
+        run: |
+          grep -q '^kind: CustomResourceDefinition$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: ServiceAccount$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: ClusterRole$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: ClusterRoleBinding$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: Role$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: RoleBinding$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: Service$' /tmp/myapp-operator-rendered.yaml
+          grep -q '^kind: Deployment$' /tmp/myapp-operator-rendered.yaml
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p /tmp/helm-package
+          helm package \
+            charts/myapp-operator \
+            --destination /tmp/helm-package
+          test -n "$(find /tmp/helm-package -maxdepth 1 -type f -name 'myapp-operator-*.tgz' -print -quit)"
+
+      - name: Build controller image
+        run: |
+          docker build \
+            -t k8s-myapp-operator:ci \
+            .

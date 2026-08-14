@@ -27,3 +27,8 @@ jobs:
         run: |
           go mod tidy
           make test
+
+      - name: Verify generated files are committed
+        run: |
+          git diff --check
+          git diff --exit-code
